@@ -45,6 +45,9 @@
 #ifdef ZMQ_HAVE_SO_PEERCRED
 #   include <pwd.h>
 #   include <grp.h>
+#   if defined ZMQ_HAVE_OPENBSD
+#       define ucred sockpeercred
+#   endif
 #endif
 
 zmq::ipc_listener_t::ipc_listener_t (io_thread_t *io_thread_,
@@ -279,6 +282,13 @@ zmq::fd_t zmq::ipc_listener_t::accept ()
             errno == ENFILE);
         return retired_fd;
     }
+
+    //  Race condition can cause socket not to be closed (if fork happens
+    //  between accept and this point).
+#ifdef FD_CLOEXEC
+    int rc = fcntl (sock, F_SETFD, FD_CLOEXEC);
+    errno_assert (rc != -1);
+#endif
 
     // IPC accept() filters
 #if defined ZMQ_HAVE_SO_PEERCRED || defined ZMQ_HAVE_LOCAL_PEERCRED

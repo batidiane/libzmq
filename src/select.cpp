@@ -41,7 +41,8 @@
 #include "config.hpp"
 #include "i_poll_events.hpp"
 
-zmq::select_t::select_t () :
+zmq::select_t::select_t (const zmq::ctx_t &ctx_) :
+    ctx(ctx_),
     maxfd (retired_fd),
     retired (false),
     stopping (false)
@@ -136,7 +137,7 @@ void zmq::select_t::reset_pollout (handle_t handle_)
 
 void zmq::select_t::start ()
 {
-    worker.start (worker_routine, this);
+    ctx.start_thread (worker, worker_routine, this);
 }
 
 void zmq::select_t::stop ()
@@ -162,8 +163,12 @@ void zmq::select_t::loop ()
         memcpy (&exceptfds, &source_set_err, sizeof source_set_err);
 
         //  Wait for events.
+#ifdef ZMQ_HAVE_OSX
+        struct timeval tv = {(long) (timeout / 1000), timeout % 1000 * 1000};
+#else
         struct timeval tv = {(long) (timeout / 1000),
             (long) (timeout % 1000 * 1000)};
+#endif
 #ifdef ZMQ_HAVE_WINDOWS
         int rc = select (0, &readfds, &writefds, &exceptfds,
             timeout ? &tv : NULL);

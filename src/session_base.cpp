@@ -25,18 +25,19 @@
 #include "tcp_connecter.hpp"
 #include "ipc_connecter.hpp"
 #include "tipc_connecter.hpp"
+#include "socks_connecter.hpp"
 #include "pgm_sender.hpp"
 #include "pgm_receiver.hpp"
 #include "address.hpp"
+#include "norm_engine.hpp"
 
 #include "ctx.hpp"
 #include "req.hpp"
 
 zmq::session_base_t *zmq::session_base_t::create (class io_thread_t *io_thread_,
     bool active_, class socket_base_t *socket_, const options_t &options_,
-    const address_t *addr_)
+    address_t *addr_)
 {
-	
     session_base_t *s = NULL;
     switch (options_.type) {
     case ZMQ_REQ:
@@ -67,7 +68,7 @@ zmq::session_base_t *zmq::session_base_t::create (class io_thread_t *io_thread_,
 
 zmq::session_base_t::session_base_t (class io_thread_t *io_thread_,
       bool active_, class socket_base_t *socket_, const options_t &options_,
-      const address_t *addr_) :
+      address_t *addr_) :
     own_t (io_thread_, options_),
     io_object_t (io_thread_),
     active (active_),
@@ -205,10 +206,14 @@ void zmq::session_base_t::pipe_terminated (pipe_t *pipe_)
              || pipe_ == zap_pipe
              || terminating_pipes.count (pipe_) == 1);
 
-    if (pipe_ == pipe)
+    if (pipe_ == pipe) {
         // If this is our current pipe, remove it
         pipe = NULL;
-    else
+        if (has_linger_timer) {
+            cancel_timer (linger_timer_id);
+            has_linger_timer = false;
+        }
+    } else
     if (pipe_ == zap_pipe)
         zap_pipe = NULL;
     else
@@ -226,14 +231,16 @@ void zmq::session_base_t::pipe_terminated (pipe_t *pipe_)
     //  If we are waiting for pending messages to be sent, at this point
     //  we are sure that there will be no more messages and we can proceed
     //  with termination safely.
-    if (pending && !pipe && !zap_pipe && terminating_pipes.empty ())
-        proceed_with_term ();
+    if (pending && !pipe && !zap_pipe && terminating_pipes.empty ()) {
+        pending = false;
+        own_t::process_term (0);
+    }
 }
 
 void zmq::session_base_t::read_activated (pipe_t *pipe_)
 {
     // Skip activating if we're detaching this pipe
-    if (unlikely(pipe_ != pipe && pipe_ != zap_pipe)) {
+    if (unlikely (pipe_ != pipe && pipe_ != zap_pipe)) {
         zmq_assert (terminating_pipes.count (pipe_) == 1);
         return;
     }
@@ -308,7 +315,6 @@ int zmq::session_base_t::zap_connect ()
     zap_pipe->set_nodelay ();
     zap_pipe->set_event_sink (this);
 
-    new_pipes [1]->set_nodelay ();
     send_bind (peer.socket, new_pipes [1], false);
 
     //  Send empty identity if required by the peer.
@@ -353,7 +359,9 @@ void zmq::session_base_t::process_attach (i_engine *engine_)
         //  Remember the local end of the pipe.
         zmq_assert (!pipe);
         pipe = pipes [0];
-
+        // Store engine assoc_fd for linking pipe to fd
+        pipe->assoc_fd = engine_->get_assoc_fd ();
+        pipes [1]->assoc_fd = pipe->assoc_fd;
         //  Ask socket to plug into the remote end of the pipe.
         send_bind (socket, pipes [1]);
     }
@@ -364,7 +372,8 @@ void zmq::session_base_t::process_attach (i_engine *engine_)
     engine->plug (io_thread, this);
 }
 
-void zmq::session_base_t::engine_error ()
+void zmq::session_base_t::engine_error (
+        zmq::stream_engine_t::error_reason_t reason)
 {
     //  Engine is dead. Let's forget about it.
     engine = NULL;
@@ -373,10 +382,22 @@ void zmq::session_base_t::engine_error ()
     if (pipe)
         clean_pipes ();
 
-    if (active)
-        reconnect ();
-    else
-        terminate ();
+    zmq_assert (reason == stream_engine_t::connection_error
+             || reason == stream_engine_t::timeout_error
+             || reason == stream_engine_t::protocol_error);
+
+    switch (reason) {
+        case stream_engine_t::timeout_error:
+        case stream_engine_t::connection_error:
+            if (active)
+                reconnect ();
+            else
+                terminate ();
+            break;
+        case stream_engine_t::protocol_error:
+            terminate ();
+            break;
+    }
 
     //  Just in case there's only a delimiter in the pipe.
     if (pipe)
@@ -393,8 +414,8 @@ void zmq::session_base_t::process_term (int linger_)
     //  If the termination of the pipe happens before the term command is
     //  delivered there's nothing much to do. We can proceed with the
     //  standard termination immediately.
-    if (!pipe && !zap_pipe) {
-        proceed_with_term ();
+    if (!pipe && !zap_pipe && terminating_pipes.empty ()) {
+        own_t::process_term (0);
         return;
     }
 
@@ -424,15 +445,6 @@ void zmq::session_base_t::process_term (int linger_)
         zap_pipe->terminate (false);
 }
 
-void zmq::session_base_t::proceed_with_term ()
-{
-    //  The pending phase has just ended.
-    pending = false;
-
-    //  Continue with standard termination.
-    own_t::process_term (0);
-}
-
 void zmq::session_base_t::timer_event (int id_)
 {
     //  Linger period expired. We can proceed with termination even though
@@ -450,7 +462,8 @@ void zmq::session_base_t::reconnect ()
     //  For delayed connect situations, terminate the pipe
     //  and reestablish later on
     if (pipe && options.immediate == 1
-        && addr->protocol != "pgm" && addr->protocol != "epgm") {
+        && addr->protocol != "pgm" && addr->protocol != "epgm"
+        && addr->protocol != "norm") {
         pipe->hiccup ();
         pipe->terminate (false);
         terminating_pipes.insert (pipe);
@@ -481,10 +494,22 @@ void zmq::session_base_t::start_connecting (bool wait_)
     //  Create the connecter object.
 
     if (addr->protocol == "tcp") {
-        tcp_connecter_t *connecter = new (std::nothrow) tcp_connecter_t (
-            io_thread, this, options, addr, wait_);
-        alloc_assert (connecter);
-        launch_child (connecter);
+        if (!options.socks_proxy_address.empty()) {
+            address_t *proxy_address = new (std::nothrow)
+                address_t ("tcp", options.socks_proxy_address);
+            alloc_assert (proxy_address);
+            socks_connecter_t *connecter =
+                new (std::nothrow) socks_connecter_t (
+                    io_thread, this, options, addr, proxy_address, wait_);
+            alloc_assert (connecter);
+            launch_child (connecter);
+        }
+        else {
+            tcp_connecter_t *connecter = new (std::nothrow)
+                tcp_connecter_t (io_thread, this, options, addr, wait_);
+            alloc_assert (connecter);
+            launch_child (connecter);
+        }
         return;
     }
 
@@ -549,6 +574,37 @@ void zmq::session_base_t::start_connecting (bool wait_)
         return;
     }
 #endif
+
+#ifdef ZMQ_HAVE_NORM
+    if (addr->protocol == "norm") {
+        //  At this point we'll create message pipes to the session straight
+        //  away. There's no point in delaying it as no concept of 'connect'
+        //  exists with NORM anyway.
+        if (options.type == ZMQ_PUB || options.type == ZMQ_XPUB) {
+
+            //  NORM sender.
+            norm_engine_t* norm_sender = new (std::nothrow) norm_engine_t(io_thread, options);
+            alloc_assert (norm_sender);
+
+            int rc = norm_sender->init (addr->address.c_str (), true, false);
+            errno_assert (rc == 0);
+
+            send_attach (this, norm_sender);
+        }
+        else {  // ZMQ_SUB or ZMQ_XSUB
+
+            //  NORM receiver.
+            norm_engine_t* norm_receiver = new (std::nothrow) norm_engine_t (io_thread, options);
+            alloc_assert (norm_receiver);
+
+            int rc = norm_receiver->init (addr->address.c_str (), false, true);
+            errno_assert (rc == 0);
+
+            send_attach (this, norm_receiver);
+        }
+        return;
+    }
+#endif // ZMQ_HAVE_NORM
 
     zmq_assert (false);
 }

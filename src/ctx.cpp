@@ -24,6 +24,7 @@
 #include <unistd.h>
 #endif
 
+#include <limits>
 #include <new>
 #include <string.h>
 
@@ -35,14 +36,23 @@
 #include "err.hpp"
 #include "msg.hpp"
 
+#ifdef HAVE_LIBSODIUM
+#ifdef HAVE_TWEETNACL
+#include "randombytes.h"
+#else
+#include "sodium.h"
+#endif
+#endif
+
 #define ZMQ_CTX_TAG_VALUE_GOOD 0xabadcafe
 #define ZMQ_CTX_TAG_VALUE_BAD  0xdeadbeef
 
 int clipped_maxsocket(int max_requested)
 {
     if (max_requested >= zmq::poller_t::max_fds () && zmq::poller_t::max_fds () != -1)
-        max_requested = zmq::poller_t::max_fds () - 1;		// -1 because we need room for the repear mailbox.
-    
+        // -1 because we need room for the reaper mailbox.
+        max_requested = zmq::poller_t::max_fds () - 1;
+
     return max_requested;
 }
 
@@ -55,7 +65,9 @@ zmq::ctx_t::ctx_t () :
     slots (NULL),
     max_sockets (clipped_maxsocket (ZMQ_MAX_SOCKETS_DFLT)),
     io_thread_count (ZMQ_IO_THREADS_DFLT),
-    ipv6 (false)
+    ipv6 (false),
+    thread_priority (ZMQ_THREAD_PRIORITY_DFLT),
+    thread_sched_policy (ZMQ_THREAD_SCHED_POLICY_DFLT)
 {
 #ifdef HAVE_FORK
     pid = getpid();
@@ -89,12 +101,26 @@ zmq::ctx_t::~ctx_t ()
     //  corresponding io_thread/socket objects.
     free (slots);
 
+    //  If we've done any Curve encryption, we may have a file handle
+    //  to /dev/urandom open that needs to be cleaned up.
+#ifdef HAVE_LIBSODIUM
+    randombytes_close();
+#endif
+
     //  Remove the tag, so that the object is considered dead.
     tag = ZMQ_CTX_TAG_VALUE_BAD;
 }
 
 int zmq::ctx_t::terminate ()
 {
+    // Connect up any pending inproc connections, otherwise we will hang
+    pending_connections_t copy = pending_connections;
+    for (pending_connections_t::iterator p = copy.begin (); p != copy.end (); ++p) {
+        zmq::socket_base_t *s = create_socket (ZMQ_PAIR);
+        s->bind (p->first.c_str ());
+        s->close ();
+    }
+
     slot_sync.lock ();
     if (!starting) {
 
@@ -103,11 +129,12 @@ int zmq::ctx_t::terminate ()
             // we are a forked child process. Close all file descriptors
             // inherited from the parent.
             for (sockets_t::size_type i = 0; i != sockets.size (); i++)
-                sockets[i]->get_mailbox()->forked();
+                sockets [i]->get_mailbox ()->forked ();
 
-            term_mailbox.forked();
+            term_mailbox.forked ();
         }
 #endif
+
         //  Check whether termination was already underway, but interrupted and now
         //  restarted.
         bool restarted = terminating;
@@ -165,7 +192,8 @@ int zmq::ctx_t::shutdown ()
 int zmq::ctx_t::set (int option_, int optval_)
 {
     int rc = 0;
-    if (option_ == ZMQ_MAX_SOCKETS && optval_ >= 1 && optval_ == clipped_maxsocket (optval_)) {
+    if (option_ == ZMQ_MAX_SOCKETS
+    &&  optval_ >= 1 && optval_ == clipped_maxsocket (optval_)) {
         opt_sync.lock ();
         max_sockets = optval_;
         opt_sync.unlock ();
@@ -182,6 +210,18 @@ int zmq::ctx_t::set (int option_, int optval_)
         ipv6 = (optval_ != 0);
         opt_sync.unlock ();
     }
+    else
+    if (option_ == ZMQ_THREAD_PRIORITY && optval_ >= 0) {
+        opt_sync.lock();
+        thread_priority = optval_;
+        opt_sync.unlock();
+    }
+    else
+    if (option_ == ZMQ_THREAD_SCHED_POLICY && optval_ >= 0) {
+        opt_sync.lock();
+        thread_sched_policy = optval_;
+        opt_sync.unlock();
+    }
     else {
         errno = EINVAL;
         rc = -1;
@@ -194,6 +234,9 @@ int zmq::ctx_t::get (int option_)
     int rc = 0;
     if (option_ == ZMQ_MAX_SOCKETS)
         rc = max_sockets;
+    else
+    if (option_ == ZMQ_SOCKET_LIMIT)
+        rc = clipped_maxsocket (65535);
     else
     if (option_ == ZMQ_IO_THREADS)
         rc = io_thread_count;
@@ -220,7 +263,7 @@ zmq::socket_base_t *zmq::ctx_t::create_socket (int type_)
         int ios = io_thread_count;
         opt_sync.unlock ();
         slot_count = mazmq + ios + 2;
-        slots = (mailbox_t**) malloc (sizeof (mailbox_t*) * slot_count);
+        slots = (mailbox_t **) malloc (sizeof (mailbox_t*) * slot_count);
         alloc_assert (slots);
 
         //  Initialise the infrastructure for zmq_ctx_term thread.
@@ -309,6 +352,12 @@ zmq::object_t *zmq::ctx_t::get_reaper ()
     return reaper;
 }
 
+void zmq::ctx_t::start_thread (thread_t &thread_, thread_fn *tfn_, void *arg_) const
+{
+    thread_.start(tfn_, arg_);
+    thread_.setSchedulingParameters(thread_priority, thread_sched_policy);
+}
+
 void zmq::ctx_t::send_command (uint32_t tid_, const command_t &command_)
 {
     slots [tid_]->send (command_);
@@ -334,12 +383,13 @@ zmq::io_thread_t *zmq::ctx_t::choose_io_thread (uint64_t affinity_)
     return selected_io_thread;
 }
 
-int zmq::ctx_t::register_endpoint (const char *addr_, endpoint_t &endpoint_)
+int zmq::ctx_t::register_endpoint (const char *addr_,
+        const endpoint_t &endpoint_)
 {
     endpoints_sync.lock ();
 
-    bool inserted = endpoints.insert (endpoints_t::value_type (
-        std::string (addr_), endpoint_)).second;
+    const bool inserted = endpoints.insert (
+        endpoints_t::value_type (std::string (addr_), endpoint_)).second;
 
     endpoints_sync.unlock ();
 
@@ -347,6 +397,26 @@ int zmq::ctx_t::register_endpoint (const char *addr_, endpoint_t &endpoint_)
         errno = EADDRINUSE;
         return -1;
     }
+    return 0;
+}
+
+int zmq::ctx_t::unregister_endpoint (
+        const std::string &addr_, socket_base_t *socket_)
+{
+    endpoints_sync.lock ();
+
+    const endpoints_t::iterator it = endpoints.find (addr_);
+    if (it == endpoints.end () || it->second.socket != socket_) {
+        endpoints_sync.unlock ();
+        errno = ENOENT;
+        return -1;
+    }
+
+    //  Remove endpoint.
+    endpoints.erase (it);
+
+    endpoints_sync.unlock ();
+
     return 0;
 }
 
@@ -364,6 +434,7 @@ void zmq::ctx_t::unregister_endpoints (socket_base_t *socket_)
         }
         ++it;
     }
+
     endpoints_sync.unlock ();
 }
 
@@ -390,19 +461,23 @@ zmq::endpoint_t zmq::ctx_t::find_endpoint (const char *addr_)
      return endpoint;
 }
 
-void zmq::ctx_t::pend_connection (const char *addr_, pending_connection_t &pending_connection_)
+void zmq::ctx_t::pend_connection (const std::string &addr_,
+        const endpoint_t &endpoint_, pipe_t **pipes_)
 {
+    const pending_connection_t pending_connection =
+        {endpoint_, pipes_ [0], pipes_ [1]};
+
     endpoints_sync.lock ();
 
     endpoints_t::iterator it = endpoints.find (addr_);
     if (it == endpoints.end ()) {
         // Still no bind.
-        pending_connection_.endpoint.socket->inc_seqnum ();
-        pending_connections.insert (pending_connections_t::value_type (std::string (addr_), pending_connection_));
+        endpoint_.socket->inc_seqnum ();
+        pending_connections.insert (pending_connections_t::value_type (addr_, pending_connection));
     }
     else
         // Bind has happened in the mean time, connect directly
-        connect_inproc_sockets(it->second.socket, it->second.options, pending_connection_, connect_side);
+        connect_inproc_sockets (it->second.socket, it->second.options, pending_connection, connect_side);
 
     endpoints_sync.unlock ();
 }
@@ -421,20 +496,19 @@ void zmq::ctx_t::connect_pending (const char *addr_, zmq::socket_base_t *bind_so
 }
 
 void zmq::ctx_t::connect_inproc_sockets (zmq::socket_base_t *bind_socket_,
-    options_t& bind_options, pending_connection_t &pending_connection_, side side_)
+    options_t& bind_options, const pending_connection_t &pending_connection_, side side_)
 {
     bind_socket_->inc_seqnum();
-    pending_connection_.bind_pipe->set_tid(bind_socket_->get_tid());
+    pending_connection_.bind_pipe->set_tid (bind_socket_->get_tid ());
 
-    if (side_ == bind_side) {
-        command_t cmd;
-        cmd.type = command_t::bind;
-        cmd.args.bind.pipe = pending_connection_.bind_pipe;
-        bind_socket_->process_command(cmd);
-        bind_socket_->send_inproc_connected(pending_connection_.endpoint.socket);
+    if (!bind_options.recv_identity) {
+        msg_t msg;
+        const bool ok = pending_connection_.bind_pipe->read (&msg);
+        zmq_assert (ok);
+        const int rc = msg.close ();
+        errno_assert (rc == 0);
     }
-    else
-        pending_connection_.connect_pipe->send_bind(bind_socket_, pending_connection_.bind_pipe, false);
+
 
     int sndhwm = 0;
     if (pending_connection_.endpoint.options.sndhwm != 0 && bind_options.rcvhwm != 0)
@@ -451,22 +525,20 @@ void zmq::ctx_t::connect_inproc_sockets (zmq::socket_base_t *bind_socket_,
              pending_connection_.endpoint.options.type == ZMQ_PUB ||
              pending_connection_.endpoint.options.type == ZMQ_SUB);
 
-       int hwms [2] = {conflate? -1 : sndhwm, conflate? -1 : rcvhwm};
-       pending_connection_.connect_pipe->set_hwms(hwms [1], hwms [0]);
-       pending_connection_.bind_pipe->set_hwms(hwms [0], hwms [1]);
+    int hwms [2] = {conflate? -1 : sndhwm, conflate? -1 : rcvhwm};
+    pending_connection_.connect_pipe->set_hwms(hwms [1], hwms [0]);
+    pending_connection_.bind_pipe->set_hwms(hwms [0], hwms [1]);
 
-    if (bind_options.recv_identity) {
-    
-        msg_t id;
-        int rc = id.init_size (pending_connection_.endpoint.options.identity_size);
-        errno_assert (rc == 0);
-        memcpy (id.data (), pending_connection_.endpoint.options.identity,
-                            pending_connection_.endpoint.options.identity_size);
-        id.set_flags (msg_t::identity);
-        bool written = pending_connection_.connect_pipe->write (&id);
-        zmq_assert (written);
-        pending_connection_.connect_pipe->flush ();
+    if (side_ == bind_side) {
+        command_t cmd;
+        cmd.type = command_t::bind;
+        cmd.args.bind.pipe = pending_connection_.bind_pipe;
+        bind_socket_->process_command (cmd);
+        bind_socket_->send_inproc_connected (pending_connection_.endpoint.socket);
     }
+    else
+        pending_connection_.connect_pipe->send_bind (bind_socket_, pending_connection_.bind_pipe, false);
+
     if (pending_connection_.endpoint.options.recv_identity) {
         msg_t id;
         int rc = id.init_size (bind_options.identity_size);

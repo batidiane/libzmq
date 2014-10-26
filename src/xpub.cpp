@@ -26,8 +26,9 @@
 
 zmq::xpub_t::xpub_t (class ctx_t *parent_, uint32_t tid_, int sid_) :
     socket_base_t (parent_, tid_, sid_),
-    verbose(false),
-    more (false)
+    verbose (false),
+    more (false),
+    lossy (true)
 {
     options.type = ZMQ_XPUB;
 }
@@ -90,15 +91,19 @@ void zmq::xpub_t::xwrite_activated (pipe_t *pipe_)
 int zmq::xpub_t::xsetsockopt (int option_, const void *optval_,
     size_t optvallen_)
 {
-    if (option_ != ZMQ_XPUB_VERBOSE) {
-        errno = EINVAL;
-        return -1;
-    }
     if (optvallen_ != sizeof (int) || *static_cast <const int*> (optval_) < 0) {
         errno = EINVAL;
         return -1;
     }
-    verbose = (*static_cast <const int*> (optval_) != 0);
+    if (option_ == ZMQ_XPUB_VERBOSE)
+        verbose = (*static_cast <const int*> (optval_) != 0);
+    else
+    if (option_ == ZMQ_XPUB_NODROP)
+        lossy = (*static_cast <const int*> (optval_) == 0);
+    else {
+        errno = EINVAL;
+        return -1;
+    }
     return 0;
 }
 
@@ -127,20 +132,20 @@ int zmq::xpub_t::xsend (msg_t *msg_)
         subscriptions.match ((unsigned char*) msg_->data (), msg_->size (),
             mark_as_matching, this);
 
-    //  Send the message to all the pipes that were marked as matching
-    //  in the previous step.
-    int rc = dist.send_to_matching (msg_);
-    if (rc != 0)
-        return rc;
-
-    //  If we are at the end of multi-part message we can mark all the pipes
-    //  as non-matching.
-    if (!msg_more)
-        dist.unmatch ();
-
-    more = msg_more;
-
-    return 0;
+    int rc = -1;            //  Assume we fail
+    if (lossy || dist.check_hwm ()) {
+        if (dist.send_to_matching (msg_) == 0) {
+            //  If we are at the end of multi-part message we can mark 
+            //  all the pipes as non-matching.
+            if (!msg_more)
+                dist.unmatch ();
+            more = msg_more;
+            rc = 0;         //  Yay, sent successfully
+        }
+    }
+    else
+        errno = EAGAIN;
+    return rc;
 }
 
 bool zmq::xpub_t::xhas_out ()
@@ -150,7 +155,7 @@ bool zmq::xpub_t::xhas_out ()
 
 int zmq::xpub_t::xrecv (msg_t *msg_)
 {
-    //  If there is at least one 
+    //  If there is at least one
     if (pending_data.empty ()) {
         errno = EAGAIN;
         return -1;
@@ -184,7 +189,8 @@ void zmq::xpub_t::send_unsubscription (unsigned char *data_, size_t size_,
         //  to be retrived by the user later on.
         blob_t unsub (size_ + 1, 0);
         unsub [0] = 0;
-        memcpy (&unsub [1], data_, size_);
+        if (size_ > 0)
+            memcpy (&unsub [1], data_, size_);
         self->pending_data.push_back (unsub);
         self->pending_flags.push_back (0);
     }

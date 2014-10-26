@@ -18,22 +18,7 @@
 */
 #define ZMQ_TYPE_UNSAFE
 
-#include "platform.hpp"
-
-#if defined ZMQ_FORCE_SELECT
-#define ZMQ_POLL_BASED_ON_SELECT
-#elif defined ZMQ_FORCE_POLL
-#define ZMQ_POLL_BASED_ON_POLL
-#elif defined ZMQ_HAVE_LINUX || defined ZMQ_HAVE_FREEBSD ||\
-    defined ZMQ_HAVE_OPENBSD || defined ZMQ_HAVE_SOLARIS ||\
-    defined ZMQ_HAVE_OSX || defined ZMQ_HAVE_QNXNTO ||\
-    defined ZMQ_HAVE_HPUX || defined ZMQ_HAVE_AIX ||\
-    defined ZMQ_HAVE_NETBSD
-#define ZMQ_POLL_BASED_ON_POLL
-#elif defined ZMQ_HAVE_WINDOWS || defined ZMQ_HAVE_OPENVMS ||\
-     defined ZMQ_HAVE_CYGWIN
-#define ZMQ_POLL_BASED_ON_SELECT
-#endif
+#include "poller.hpp"
 
 //  On AIX platform, poll.h has to be included first to get consistent
 //  definition of pollfd structure (AIX uses 'reqevents' and 'retnevents'
@@ -78,6 +63,7 @@ struct iovec {
 #include "err.hpp"
 #include "msg.hpp"
 #include "fd.hpp"
+#include "metadata.hpp"
 
 #if !defined ZMQ_HAVE_WINDOWS
 #include <unistd.h>
@@ -228,7 +214,7 @@ void *zmq_init (int io_threads_)
         return ctx;
     }
     errno = EINVAL;
-    return NULL;   
+    return NULL;
 }
 
 int zmq_term (void *ctx_)
@@ -380,7 +366,7 @@ int zmq_send (void *s_, const void *buf_, size_t len_, int flags_)
         errno = err;
         return -1;
     }
-    
+
     //  Note the optimisation here. We don't close the msg object as it is
     //  empty anyway. This may change when implementation of zmq_msg_t changes.
     return rc;
@@ -406,7 +392,7 @@ int zmq_send_const (void *s_, const void *buf_, size_t len_, int flags_)
         errno = err;
         return -1;
     }
-    
+
     //  Note the optimisation here. We don't close the msg object as it is
     //  empty anyway. This may change when implementation of zmq_msg_t changes.
     return rc;
@@ -429,7 +415,7 @@ int zmq_sendiov (void *s_, iovec *a_, size_t count_, int flags_)
     int rc = 0;
     zmq_msg_t msg;
     zmq::socket_base_t *s = (zmq::socket_base_t *) s_;
-    
+
     for (size_t i = 0; i < count_; ++i) {
         rc = zmq_msg_init_size (&msg, a_[i].iov_len);
         if (rc != 0) {
@@ -449,7 +435,7 @@ int zmq_sendiov (void *s_, iovec *a_, size_t count_, int flags_)
            break;
         }
     }
-    return rc; 
+    return rc;
 }
 
 // Receiving functions.
@@ -502,7 +488,7 @@ int zmq_recv (void *s_, void *buf_, size_t len_, int flags_)
 }
 
 // Receive a multi-part message
-// 
+//
 // Receives up to *count_ parts of a multi-part message.
 // Sets *count_ to the actual number of parts read.
 // ZMQ_RCVMORE is set to indicate if a complete multi-part message was read.
@@ -513,7 +499,7 @@ int zmq_recv (void *s_, void *buf_, size_t len_, int flags_)
 // *count_ to retrieve message parts successfully read,
 // even if -1 is returned.
 //
-// The iov_base* buffers of each iovec *a_ filled in by this 
+// The iov_base* buffers of each iovec *a_ filled in by this
 // function may be freed using free().
 // TODO: this function has no man page
 //
@@ -528,11 +514,11 @@ int zmq_recviov (void *s_, iovec *a_, size_t *count_, int flags_)
     size_t count = *count_;
     int nread = 0;
     bool recvmore = true;
-    
+
     *count_ = 0;
 
     for (size_t i = 0; recvmore && i < count; ++i) {
-       
+
         zmq_msg_t msg;
         int rc = zmq_msg_init (&msg);
         errno_assert (rc == 0);
@@ -548,7 +534,7 @@ int zmq_recviov (void *s_, iovec *a_, size_t *count_, int flags_)
         }
 
         a_[i].iov_len = zmq_msg_size (&msg);
-        a_[i].iov_base = malloc(a_[i].iov_len);
+        a_[i].iov_base = static_cast<char *> (malloc(a_[i].iov_len));
         if (unlikely (!a_[i].iov_base)) {
             errno = ENOMEM;
             return -1;
@@ -635,13 +621,17 @@ int zmq_msg_more (zmq_msg_t *msg_)
     return zmq_msg_get (msg_, ZMQ_MORE);
 }
 
-int zmq_msg_get (zmq_msg_t *msg_, int option_)
+int zmq_msg_get (zmq_msg_t *msg_, int property_)
 {
-    switch (option_) {
+    switch (property_) {
         case ZMQ_MORE:
             return (((zmq::msg_t*) msg_)->flags () & zmq::msg_t::more)? 1: 0;
         case ZMQ_SRCFD:
+            // warning: int64_t to int
             return ((zmq::msg_t*) msg_)->fd ();
+        case ZMQ_SHARED:
+            return (((zmq::msg_t*) msg_)->is_cmsg ()) ||
+                   (((zmq::msg_t*) msg_)->flags () & zmq::msg_t::shared)? 1: 0;
         default:
             errno = EINVAL;
             return -1;
@@ -650,9 +640,26 @@ int zmq_msg_get (zmq_msg_t *msg_, int option_)
 
 int zmq_msg_set (zmq_msg_t *, int, int)
 {
-    //  No options supported at present
+    //  No properties supported at present
     errno = EINVAL;
     return -1;
+}
+
+
+//  Get message metadata string
+
+const char *zmq_msg_gets (zmq_msg_t *msg_, const char *property_)
+{
+    zmq::metadata_t *metadata = ((zmq::msg_t*) msg_)->metadata ();
+    const char *value = NULL;
+    if (metadata)
+        value = metadata->get (std::string (property_));
+    if (value)
+        return value;
+    else {
+        errno = EINVAL;
+        return NULL;
+    }
 }
 
 // Polling.
@@ -715,7 +722,8 @@ int zmq_poll (zmq_pollitem_t *items_, int nitems_, long timeout_)
             pollfds [i].fd = items_ [i].fd;
             pollfds [i].events =
                 (items_ [i].events & ZMQ_POLLIN ? POLLIN : 0) |
-                (items_ [i].events & ZMQ_POLLOUT ? POLLOUT : 0);
+                (items_ [i].events & ZMQ_POLLOUT ? POLLOUT : 0) |
+                (items_ [i].events & ZMQ_POLLPRI ? POLLPRI : 0);
         }
     }
 
@@ -774,7 +782,9 @@ int zmq_poll (zmq_pollitem_t *items_, int nitems_, long timeout_)
                     items_ [i].revents |= ZMQ_POLLIN;
                 if (pollfds [i].revents & POLLOUT)
                     items_ [i].revents |= ZMQ_POLLOUT;
-                if (pollfds [i].revents & ~(POLLIN | POLLOUT))
+                if (pollfds [i].revents & POLLPRI)
+                   items_ [i].revents |= ZMQ_POLLPRI;
+                if (pollfds [i].revents & ~(POLLIN | POLLOUT | POLLPRI))
                     items_ [i].revents |= ZMQ_POLLERR;
             }
 
@@ -1009,71 +1019,70 @@ int zmq_poll (zmq_pollitem_t *items_, int nitems_, long timeout_)
 #endif
 }
 
-#if defined ZMQ_POLL_BASED_ON_SELECT
-#undef ZMQ_POLL_BASED_ON_SELECT
-#endif
-#if defined ZMQ_POLL_BASED_ON_POLL
-#undef ZMQ_POLL_BASED_ON_POLL
-#endif
-
 //  The proxy functionality
-
-//  Compile time check whether proxy_hook_t fits into zmq_proxy_hook_t.
-typedef char check_proxy_hook_t_size
-    [sizeof (zmq::proxy_hook_t) ==  sizeof (zmq_proxy_hook_t) ? 1 : -1];
-
 
 int zmq_proxy (void *frontend_, void *backend_, void *capture_)
 {
-    zmq::socket_base_t* frontends_[] = {(zmq::socket_base_t*) frontend_, NULL};
-    zmq::socket_base_t* backends_[] = {(zmq::socket_base_t*) backend_, NULL};
+    if (!frontend_ || !backend_) {
+        errno = EFAULT;
+        return -1;
+    }
     return zmq::proxy (
-        (zmq::socket_base_t**) frontends_,
-        (zmq::socket_base_t**) backends_,
+        (zmq::socket_base_t*) frontend_,
+        (zmq::socket_base_t*) backend_,
         (zmq::socket_base_t*) capture_);
 }
 
 int zmq_proxy_steerable (void *frontend_, void *backend_, void *capture_, void *control_)
 {
-    zmq::socket_base_t* frontends_[] = {(zmq::socket_base_t*) frontend_, NULL};
-    zmq::socket_base_t* backends_[] = {(zmq::socket_base_t*) backend_, NULL};
+    if (!frontend_ || !backend_) {
+        errno = EFAULT;
+        return -1;
+    }
     return zmq::proxy (
-        (zmq::socket_base_t**) frontends_,
-        (zmq::socket_base_t**) backends_,
+        (zmq::socket_base_t*) frontend_,
+        (zmq::socket_base_t*) backend_,
         (zmq::socket_base_t*) capture_,
         (zmq::socket_base_t*) control_);
-}
-
-int zmq_proxy_hook (void *frontend_, void *backend_, void *capture_, void *hook_, void *control_)
-{
-    zmq::socket_base_t* frontends_[] = {(zmq::socket_base_t*) frontend_, NULL};
-    zmq::socket_base_t* backends_[] = {(zmq::socket_base_t*) backend_, NULL};
-    zmq::proxy_hook_t* hooks_[] = {(zmq::proxy_hook_t*) hook_};
-    return zmq::proxy (
-        (zmq::socket_base_t**) frontends_,
-        (zmq::socket_base_t**) backends_,
-        (zmq::socket_base_t*) capture_,
-        (zmq::socket_base_t*) control_,
-        (zmq::proxy_hook_t**)  hooks_);
-}
-
-int zmq_proxy_chain (void **frontends_, void **backends_, void *capture_, void **hooks_, void *control_)
-{
-    return zmq::proxy (
-        (zmq::socket_base_t**) frontends_,
-        (zmq::socket_base_t**) backends_,
-        (zmq::socket_base_t*) capture_,
-        (zmq::socket_base_t*) control_,
-        (zmq::proxy_hook_t**)  hooks_);
 }
 
 //  The deprecated device functionality
 
 int zmq_device (int /* type */, void *frontend_, void *backend_)
 {
-    zmq::socket_base_t* frontends_[] = {(zmq::socket_base_t*) frontend_, NULL};
-    zmq::socket_base_t* backends_[] = {(zmq::socket_base_t*) backend_, NULL};
     return zmq::proxy (
-        (zmq::socket_base_t**) frontends_,
-        (zmq::socket_base_t**) backends_);
+        (zmq::socket_base_t*) frontend_,
+        (zmq::socket_base_t*) backend_, NULL);
+}
+
+//  Probe library capabilities; for now, reports on transport and security
+
+int zmq_has (const char *capability)
+{
+#if !defined (ZMQ_HAVE_WINDOWS) && !defined (ZMQ_HAVE_OPENVMS)
+    if (strcmp (capability, "ipc") == 0)
+        return true;
+#endif
+#if defined (ZMQ_HAVE_OPENPGM)
+    if (strcmp (capability, "pgm") == 0)
+        return true;
+#endif
+#if defined (ZMQ_HAVE_TIPC)
+    if (strcmp (capability, "tipc") == 0)
+        return true;
+#endif
+#if defined (ZMQ_HAVE_NORM)
+    if (strcmp (capability, "norm") == 0)
+        return true;
+#endif
+#if defined (HAVE_LIBSODIUM)
+    if (strcmp (capability, "curve") == 0)
+        return true;
+#endif
+#if defined (HAVE_LIBGSSAPI_KRB5)
+    if (strcmp (capability, "gssapi") == 0)
+        return true;
+#endif
+    //  Whatever the application asked for, we don't have
+    return false;
 }
