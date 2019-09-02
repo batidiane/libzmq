@@ -33,9 +33,12 @@ Specifies that the message being sent is a multi-part message, and that further
 message parts are to follow. Refer to the section regarding multi-part messages
 below for a detailed description.
 
-The _zmq_msg_t_ structure passed to _zmq_msg_send()_ is nullified during the
-call. If you want to send the same message to multiple sockets you have to copy
-it using (e.g. using _zmq_msg_copy()_).
+The _zmq_msg_t_ structure passed to _zmq_msg_send()_ is nullified on a
+successful call. If you want to send the same message to multiple sockets you
+have to copy it (e.g. using _zmq_msg_copy()_). If the call fails, the
+_zmq_msg_t_ structure stays intact, and must be consumed by another call to
+_zmq_msg_send()_ on the same or another socket, or released using
+_zmq_msg_close()_ to avoid a memory leak.
 
 NOTE: A successful invocation of _zmq_msg_send()_ does not indicate that the
 message has been transmitted to the network, only that it has been queued on
@@ -57,7 +60,8 @@ when sending each message part except the final one.
 RETURN VALUE
 ------------
 The _zmq_msg_send()_ function shall return number of bytes in the message
-if successful. Otherwise it shall return `-1` and set 'errno' to one of the
+if successful (if number of bytes is higher than 'MAX_INT', the function will
+return 'MAX_INT'). Otherwise it shall return `-1` and set 'errno' to one of the
 values defined below.
 
 
@@ -67,6 +71,8 @@ ERRORS
 Non-blocking mode was requested and the message cannot be sent at the moment.
 *ENOTSUP*::
 The _zmq_msg_send()_ operation is not supported by this socket type.
+*EINVAL*::
+The sender tried to send multipart data, which the socket type does not allow.
 *EFSM*::
 The _zmq_msg_send()_ operation cannot be performed on this socket at the moment
 due to the socket not being in the appropriate state.  This error may occur with
